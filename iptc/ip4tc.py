@@ -6,13 +6,16 @@ import ctypes as ct
 import shlex
 import socket
 import struct
+import sys
 import weakref
 
-from util import find_library
+from util import find_library, load_kernel
 from xtables import (XT_INV_PROTO, NFPROTO_IPV4, XTablesError, xtables,
                      xt_align, xt_counters, xt_entry_target, xt_entry_match)
 
 __all__ = ["Table", "Chain", "Rule", "Match", "Target", "Policy", "IPTCError"]
+
+load_kernel("ip_tables")
 
 _IFNAMSIZ = 16
 
@@ -100,7 +103,7 @@ _libiptc, _ = find_library("ip4tc", "iptc")  # old iptables versions use iptc
 class iptc(object):
     """This class contains all libiptc API calls."""
     iptc_init = _libiptc.iptc_init
-    iptc_init.restype = ct.c_void_p
+    iptc_init.restype = ct.POINTER(ct.c_int)
     iptc_init.argstype = [ct.c_char_p]
 
     iptc_free = _libiptc.iptc_free
@@ -117,11 +120,11 @@ class iptc(object):
 
     iptc_first_chain = _libiptc.iptc_first_chain
     iptc_first_chain.restype = ct.c_char_p
-    iptc_first_chain.argstype = [ct.c_char_p, ct.c_void_p]
+    iptc_first_chain.argstype = [ct.c_void_p]
 
     iptc_next_chain = _libiptc.iptc_next_chain
     iptc_next_chain.restype = ct.c_char_p
-    iptc_next_chain.argstype = [ct.c_char_p, ct.c_void_p]
+    iptc_next_chain.argstype = [ct.c_void_p]
 
     iptc_is_chain = _libiptc.iptc_is_chain
     iptc_is_chain.restype = ct.c_int
@@ -285,34 +288,40 @@ class IPTCModule(object):
     def _parse(self, argv, inv, entry):
         raise NotImplementedError()
 
-    def final_check(self):
-        if self._module:
-            self._final_check()  # subclasses override this
-
-    def _final_check(self):
-        raise NotImplementedError()
+    def _get_saved_buf(self, ip):
+        if not self._module or not self._module.save:
+            return None
+        # redirect C stdout to a pipe and read back the output of m->save
+        fd = sys.stdout.fileno()
+        with os.fdopen(os.dup(fd), 'w') as old_stdout:
+            try:
+                pipes = os.pipe()
+                sys.stdout.close()
+                os.dup2(pipes[1], fd)
+                sys.stdout = os.fdopen(fd, 'w')
+                self._xt.save(self._module, ip, self._ptr)
+                buf = os.read(pipes[0], 1024)
+                os.close(pipes[0])
+                os.close(pipes[1])
+                return buf
+            finally:
+                sys.stdout.close()
+                os.dup2(old_stdout.fileno(), fd)
+                sys.stdout = os.fdopen(fd, 'w')
 
     def save(self, name):
         return self._save(name, self.rule.get_ip())
 
     def _save(self, name, ip):
-        if self._module and self._module.save:
-            # redirect C stdout to a pipe and read back the output of m->save
-            pipes = os.pipe()
-            saved_out = os.dup(1)
-            os.dup2(pipes[1], 1)
-            self._xt.save(self._module, ip, self._ptr)
-            buf = os.read(pipes[0], 1024)
-            os.dup2(saved_out, 1)
-            os.close(pipes[0])
-            os.close(pipes[1])
-            os.close(saved_out)
-            if name:
-                return self._get_value(buf, name)
-            else:
-                return self._get_all_values(buf)
-        else:
+        buf = self._get_saved_buf(ip)
+        if buf is None:
             return None
+        if not self._module or not self._module.save:
+            return None
+        if name:
+            return self._get_value(buf, name)
+        else:
+            return self._get_all_values(buf)
 
     def _get_all_values(self, buf):
         table = {}  # variable -> (value, inverted)
@@ -337,27 +346,12 @@ class IPTCModule(object):
     def get_all_parameters(self):
         params = {}
         ip = self.rule.get_ip()
-        if self._module and self._module.save:
-            # redirect C stdout to a pipe and read back the output of m->save
-            pipes = os.pipe()
-            saved_out = os.dup(1)
-            os.dup2(pipes[1], 1)
-            self._xt.save(self._module, ip, self._ptr)
-            buf = os.read(pipes[0], 1024)
-            os.dup2(saved_out, 1)
-            os.close(pipes[0])
-            os.close(pipes[1])
-            os.close(saved_out)
-
+        buf = self._get_saved_buf(ip)
+        if buf is not None:
             res = re.findall(IPTCModule.pattern, buf)
             for x in res:
                 params[x[1]] = "%s%s" % ((x[0] or x[2]) and "!" or "", x[3])
-
         return params
-
-    def _update_parameters(self):
-        for k, v in self.get_all_parameters().iteritems():
-            self.__setattr__(k, v)
 
     def __setattr__(self, name, value):
         if not name.startswith('_') and name not in dir(self):
@@ -388,6 +382,20 @@ class IPTCModule(object):
         self._rule = rule
     rule = property(_get_rule, _set_rule)
     """The rule this target or match belong to."""
+
+
+class _Buffer(object):
+    def __init__(self, size=0):
+        if size > 0:
+            self.buffer = _malloc(size)
+            if self.buffer is None:
+                raise Exception("Can't allocate buffer")
+        else:
+            self.buffer = None
+
+    def __del__(self):
+        if self.buffer is not None:
+            _free(self.buffer)
 
 
 class Match(IPTCModule):
@@ -424,6 +432,8 @@ class Match(IPTCModule):
             name = match.u.user.name
         self._name = name
         self._rule = rule
+        self._alias = None
+        self._real_name = None
 
         self._xt = xtables(rule.nfproto)
 
@@ -436,12 +446,13 @@ class Match(IPTCModule):
             self._revision = revision
         else:
             self._revision = self._module.revision
+        if self._module.next is not None:
+            self._store_buffer(module)
 
         self._match_buf = (ct.c_ubyte * self.size)()
         if match:
             ct.memmove(ct.byref(self._match_buf), ct.byref(match), self.size)
             self._update_pointers()
-            self._update_parameters()
         else:
             self.reset()
 
@@ -455,14 +466,34 @@ class Match(IPTCModule):
             return True
         return False
 
-    def __ne__(self, rule):
-        return not self.__eq__(rule)
+    def __ne__(self, match):
+        return not self.__eq__(match)
 
-    def _final_check(self):
-        self._xt.final_check_match(self._module)
+    def _check_alias(self, module, match):
+        # This is ugly, but there are extensions using an alias name. Check if
+        # that's the case, and load that extension as well if necessary. It
+        # will be used to parse parameters, since the 'real' extension
+        # probably won't understand them.
+        if getattr(module, "real_name", None) is not None and module.real_name:
+            self._real_name = module.real_name
+        if getattr(module, "alias", None) is not None and module.alias:
+            self._alias_name = module.alias(match)
+            alias = self._xt.find_match(self._alias_name)
+            if not alias:
+                raise XTablesError("can't find alias match %s" %
+                                   (self._alias_name))
+            self._alias = alias[0]
+
+    def _store_buffer(self, module):
+        self._buffer = _Buffer()
+        self._buffer.buffer = ct.cast(module, ct.POINTER(ct.c_ubyte))
 
     def _parse(self, argv, inv, entry):
-        self._xt.parse_match(argv, inv, self._module, entry,
+        if self._alias is not None:
+            module = self._alias
+        else:
+            module = self._module
+        self._xt.parse_match(argv, inv, module, entry,
                              ct.cast(self._ptrptr, ct.POINTER(ct.c_void_p)))
 
     def _get_size(self):
@@ -482,6 +513,17 @@ class Match(IPTCModule):
         self._ptrptr = ct.cast(ct.pointer(self._ptr),
                                ct.POINTER(ct.POINTER(xt_entry_match)))
         self._module.m = self._ptr
+        self._check_alias(self._module, self._module.m)
+        if self._alias is not None:
+            self._alias.m = self._ptr
+        self._update_name()
+
+    def _update_name(self):
+        m = self._ptr[0]
+        if self._real_name is not None:
+            m.u.user.name = self._real_name
+        else:
+            m.u.user.name = self.name
 
     def reset(self):
         """Reset the match.
@@ -490,7 +532,6 @@ class Match(IPTCModule):
         ct.memset(ct.byref(self._match_buf), 0, self.size)
         self._update_pointers()
         m = self._ptr[0]
-        m.u.user.name = self.name
         m.u.match_size = self.size
         m.u.user.revision = self._revision
         if self._module.init:
@@ -556,14 +597,10 @@ class Target(IPTCModule):
         else:
             self._revision = self._module.revision
 
-        self._allocate_buffer(target)
+        self._create_buffer(target)
 
         if self._is_standard_target():
             self.standard_target = name
-
-    def __del__(self):
-        if getattr(self, "_target_buf", None) and self._target_buf is not None:
-            _free(self._target_buf)
 
     def __eq__(self, targ):
         basesz = ct.sizeof(xt_entry_target)
@@ -583,17 +620,30 @@ class Target(IPTCModule):
             return True
         return False
 
-    def __ne__(self, rule):
-        return not self.__eq__(rule)
+    def __ne__(self, target):
+        return not self.__eq__(target)
 
-    def _allocate_buffer(self, target):
-        self._target_buf = _malloc(self.size)
-        if self._target_buf is None:
-            raise Exception("Can't allocate target buffer")
+    def _check_alias(self, module, target):
+        # This is ugly, but there are extensions using an alias name. Check if
+        # that's the case, and load that extension as well if necessary. It
+        # will be used to parse parameters, since the 'real' extension
+        # probably won't understand them.
+        if getattr(module, "real_name", None) is not None and module.real_name:
+            self._real_name = module.real_name
+        if getattr(module, "alias", None) is not None and module.alias:
+            self._alias_name = module.alias(target)
+            alias = self._xt.find_target(self._alias_name)
+            if not alias:
+                raise XTablesError("can't find alias target %s" %
+                                   (self._alias_name))
+            self._alias = alias[0]
+
+    def _create_buffer(self, target):
+        self._buffer = _Buffer(self.size)
+        self._target_buf = self._buffer.buffer
         if target:
             ct.memmove(self._target_buf, ct.byref(target), self.size)
             self._update_pointers()
-            self._update_parameters()
         else:
             self.reset()
 
@@ -603,13 +653,15 @@ class Target(IPTCModule):
                 return True
         return False
 
-    def _final_check(self):
-        self._xt.final_check_target(self._module)
-
     def _parse(self, argv, inv, entry):
-        self._xt.parse_target(argv, inv, self._module, entry,
+        if self._alias is not None:
+            module = self._alias
+        else:
+            module = self._module
+        self._xt.parse_target(argv, inv, module, entry,
                               ct.cast(self._ptrptr, ct.POINTER(ct.c_void_p)))
         self._target_buf = ct.cast(self._module.t, ct.POINTER(ct.c_ubyte))
+        self._buffer.buffer = self._target_buf
         self._update_pointers()
 
     def _get_size(self):
@@ -641,6 +693,17 @@ class Target(IPTCModule):
         self._ptrptr = ct.cast(ct.pointer(self._ptr),
                                ct.POINTER(ct.POINTER(xt_entry_target)))
         self._module.t = self._ptr
+        self._check_alias(self._module, self._module.t)
+        if self._alias is not None:
+            self._alias.t = self._ptr
+        self._update_name()
+
+    def _update_name(self):
+        m = self._ptr[0]
+        if self._real_name is not None:
+            m.u.user.name = self._real_name
+        else:
+            m.u.user.name = self.name
 
     def reset(self):
         """Reset the target.  Parameters are set to their default values, any
@@ -648,7 +711,6 @@ class Target(IPTCModule):
         ct.memset(self._target_buf, 0, self.size)
         self._update_pointers()
         t = self._ptr[0]
-        t.u.user.name = self.name
         t.u.target_size = self.size
         t.u.user.revision = self._revision
         if self._module.init:
@@ -712,12 +774,32 @@ class Rule(object):
         * One target.  This determines what happens with the packet if it is
           matched.
     """
+
     protocols = {0: "all",
-                 socket.IPPROTO_TCP: "tcp",
-                 socket.IPPROTO_UDP: "udp",
-                 socket.IPPROTO_ICMP: "icmp",
+                 socket.IPPROTO_AH: "ah",
+                 socket.IPPROTO_DSTOPTS: "dstopts",
+                 socket.IPPROTO_EGP: "egp",
                  socket.IPPROTO_ESP: "esp",
-                 socket.IPPROTO_AH: "ah"}
+                 socket.IPPROTO_FRAGMENT: "fragment",
+                 socket.IPPROTO_GRE: "gre",
+                 socket.IPPROTO_HOPOPTS: "hopopts",
+                 socket.IPPROTO_ICMP: "icmp",
+                 socket.IPPROTO_ICMPV6: "icmpv6",
+                 socket.IPPROTO_IDP: "idp",
+                 socket.IPPROTO_IGMP: "igmp",
+                 socket.IPPROTO_IP: "ip",
+                 socket.IPPROTO_IPIP: "ipip",
+                 socket.IPPROTO_IPV6: "ipv6",
+                 socket.IPPROTO_NONE: "none",
+                 socket.IPPROTO_PIM: "pim",
+                 socket.IPPROTO_PUP: "pup",
+                 socket.IPPROTO_RAW: "raw",
+                 socket.IPPROTO_ROUTING: "routing",
+                 socket.IPPROTO_RSVP: "rsvp",
+                 socket.IPPROTO_TCP: "tcp",
+                 socket.IPPROTO_TP: "tp",
+                 socket.IPPROTO_UDP: "udp",
+                 }
 
     def __init__(self, entry=None, chain=None):
         """
@@ -753,13 +835,6 @@ class Rule(object):
         return [Table(t) for t in Table.ALL if is_table_available(t)]
     tables = property(_get_tables)
     """This is the list of tables for our protocol."""
-
-    def final_check(self):
-        """Do a final check on the target and the matches."""
-        if self.target:
-            self.target.final_check()
-        for match in self.matches:
-            match.final_check()
 
     def create_match(self, name, revision=None):
         """Create a *match*, and add it to the list of matches in this rule.
@@ -1216,7 +1291,6 @@ class Chain(object):
 
     def append_rule(self, rule):
         """Append *rule* to the end of the chain."""
-        rule.final_check()
         rbuf = rule.rule
         if not rbuf:
             raise ValueError("invalid rule")
@@ -1225,7 +1299,6 @@ class Chain(object):
     def insert_rule(self, rule, position=0):
         """Insert *rule* as the first entry in the chain if *position* is 0 or
         not specified, else *rule* is inserted in the given position."""
-        rule.final_check()
         rbuf = rule.rule
         if not rbuf:
             raise ValueError("invalid rule")
@@ -1233,7 +1306,6 @@ class Chain(object):
 
     def delete_rule(self, rule):
         """Removes *rule* from the chain."""
-        rule.final_check()
         rbuf = rule.rule
         if not rbuf:
             raise ValueError("invalid rule")
@@ -1302,7 +1374,7 @@ class Table(object):
     ALL = ["filter", "mangle", "raw", "nat"]
     """This is the constant for all tables."""
 
-    _cache = weakref.WeakValueDictionary()
+    _cache = dict()
 
     def __new__(cls, name, autocommit=None):
         obj = Table._cache.get(name, None)
@@ -1346,7 +1418,8 @@ class Table(object):
         if self._handle is None:
             raise IPTCError("table is not initialized")
         try:
-            self.commit()
+            if self.autocommit:
+                self.commit()
         except IPTCError, e:
             if not ignore_exc:
                 raise e

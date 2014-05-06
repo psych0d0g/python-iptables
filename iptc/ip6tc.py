@@ -82,7 +82,7 @@ _libiptc, _ = find_library("ip6tc", "iptc")  # old iptables versions use iptc
 class ip6tc(object):
     """This class contains all libip6tc API calls."""
     iptc_init = _libiptc.ip6tc_init
-    iptc_init.restype = ct.c_void_p
+    iptc_init.restype = ct.POINTER(ct.c_int)
     iptc_init.argstype = [ct.c_char_p]
 
     iptc_free = _libiptc.ip6tc_free
@@ -99,11 +99,11 @@ class ip6tc(object):
 
     iptc_first_chain = _libiptc.ip6tc_first_chain
     iptc_first_chain.restype = ct.c_char_p
-    iptc_first_chain.argstype = [ct.c_char_p, ct.c_void_p]
+    iptc_first_chain.argstype = [ct.c_void_p]
 
     iptc_next_chain = _libiptc.ip6tc_next_chain
     iptc_next_chain.restype = ct.c_char_p
-    iptc_next_chain.argstype = [ct.c_char_p, ct.c_void_p]
+    iptc_next_chain.argstype = [ct.c_void_p]
 
     iptc_is_chain = _libiptc.ip6tc_is_chain
     iptc_is_chain.restype = ct.c_int
@@ -569,7 +569,7 @@ class Table6(Table):
     ALL = ["filter", "mangle", "raw", "security"]
     """This is the constant for all tables."""
 
-    _cache = weakref.WeakValueDictionary()
+    _cache = dict()
 
     def __new__(cls, name, autocommit=None):
         obj = Table6._cache.get(name, None)
